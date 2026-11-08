@@ -4,6 +4,7 @@ import express, {
 } from "express";
 
 import cookieParser from "cookie-parser";
+import { ipBlocklist } from "./middleware/ipBlocklist.js";
 
 import { config } from "./config.js";
 import { pool, migrate } from "./db.js";
@@ -18,6 +19,7 @@ const app = express();
 
 app.use(express.json({ limit: "10kb" }));
 app.use(cookieParser());
+app.use("/api", ipBlocklist);
 app.use("/api/auth", authRouter);
 
 app.get("/api/health", async (_req, res) => {

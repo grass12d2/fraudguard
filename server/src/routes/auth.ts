@@ -1,13 +1,21 @@
-
 import { Router } from "express";
 import { z } from "zod";
 import { randomBytes, createHash } from "node:crypto";
 import QRCode from "qrcode";
 
+
 import { pool } from "../db.js";
 import { config } from "../config.js";
 import { redis } from "../redis.js";
 import { ah } from "../util.js";
+import { logEvent } from "../services/securityEvents.js";
+import { completeLogin } from "../services/deviceTracker.js";
+
+import {
+    isAccountLocked,
+    registerFailure,
+    resetAccountFailures,
+} from "../services/loginGuard.js";
 
 import { validate } from "../middleware/validate.js";
 import {
@@ -101,14 +109,6 @@ function randomToken(): string {
 // SHA-256 хеширование токена
 function sha256(value: string): string {
     return createHash("sha256").update(value).digest("hex");
-}
-
-// Временная реализация.
-// Полностью реализуется в задании 3.
-async function logEvent(
-    event: Record<string, unknown>,
-): Promise<void> {
-    console.log(event);
 }
 
 // Получение IP клиента
@@ -226,6 +226,7 @@ authRouter.post(
 // POST /api/auth/login
 // ============================================
 
+
 authRouter.post(
     "/login",
     validate(loginSchema),
@@ -234,6 +235,25 @@ authRouter.post(
             email,
             password: loginPassword,
         } = req.body as z.infer<typeof loginSchema>;
+
+        const ip = clientIp(req);
+
+        // Проверка блокировки учётной записи
+        if (await isAccountLocked(email)) {
+            await logEvent({
+                type: "RATE_LIMITED",
+                severity: "low",
+                email,
+                ip,
+                details: {
+                    reason: "ACCOUNT_LOCKED",
+                },
+            });
+
+            return res.status(429).json({
+                error: "Повторите через 15 мин",
+            });
+        }
 
         const { rows } = await pool.query<{
             id: number;
@@ -267,12 +287,53 @@ authRouter.post(
         );
 
         if (!user || !passwordValid) {
+            const result = await registerFailure(email, ip);
+
             await logEvent({
                 type: "LOGIN_FAILED",
-                severity: "warning",
+                severity: "low",
                 email,
-                ip: clientIp(req),
+                ip,
+                details: {
+                    accountFailures: result.accountFailures,
+                    ipFailures: result.ipFailures,
+                    distinctEmails: result.distinctEmails,
+                },
             });
+
+            if (result.accountLocked) {
+                await logEvent({
+                    type: "ACCOUNT_LOCKED",
+                    severity: "medium",
+                    email,
+                    ip,
+                    details: {
+                        failures: result.accountFailures,
+                    },
+                });
+            }
+
+                        if (result.credentialStuffing) {
+                await logEvent({
+                    type: "CREDENTIAL_STUFFING",
+                    severity: "high",
+                    ip,
+                    details: {
+                        distinctEmails: result.distinctEmails,
+                    },
+                });
+            }
+
+            if (result.ipBlocked && !result.credentialStuffing) {
+                await logEvent({
+                    type: "IP_BLOCKED",
+                    severity: "high",
+                    ip,
+                    details: {
+                        failures: result.ipFailures,
+                    },
+                });
+            }
 
             return res.status(401).json({
                 error: "Неверный email или пароль",
@@ -288,10 +349,21 @@ authRouter.post(
 
         // Проверка замороженного аккаунта
         if (user.status === "frozen") {
+            await logEvent({
+                type: "ACCOUNT_FROZEN",
+                severity: "critical",
+                userId: user.id,
+                email: user.email,
+                ip,
+            });
+
             return res.status(403).json({
                 error: "Учётная запись заморожена",
             });
         }
+
+        // Сброс счётчика ошибок после успешной проверки пароля
+        await resetAccountFailures(email);
 
         // Если включена двухфакторная аутентификация
         if (user.totp_enabled) {
@@ -317,13 +389,33 @@ authRouter.post(
             });
         }
 
+        // Проверка идентификатора устройства
+        const fingerprint = req.get("X-Device-Id");
+
+        if (
+            !fingerprint ||
+            !/^[a-f0-9]{64}$/i.test(fingerprint)
+        ) {
+            return res.status(400).json({
+                error: "Некорректный идентификатор устройства",
+            });
+        }
+
+        // Регистрация устройства и проверка сети
+        await completeLogin(
+            user.id,
+            user.email,
+            ip,
+            fingerprint,
+            req.get("User-Agent") ?? "",
+        );
+
         // Создание access JWT
         const accessToken = signAccess(
             user.id,
             user.role,
         );
 
-        // Установка защищённой cookie
         setAuthCookie(res, accessToken);
 
         await logEvent({
@@ -331,7 +423,7 @@ authRouter.post(
             severity: "info",
             userId: user.id,
             email: user.email,
-            ip: clientIp(req),
+            ip,
         });
 
         return res.json({
@@ -344,6 +436,7 @@ authRouter.post(
         });
     }),
 );
+
 
 // ============================================
 // LOGIN WITH TOTP
@@ -410,12 +503,30 @@ authRouter.post(
 
         const user = rows[0];
 
-        if (
-            !user ||
-            user.status === "frozen" ||
-            !user.totp_enabled ||
-            !user.totp_secret
-        ) {
+        // Проверка существования и состояния пользователя
+        if (!user) {
+            return res.status(401).json({
+                error: "Недействительная MFA-сессия",
+            });
+        }
+
+        // Проверка замороженного аккаунта
+        if (user.status === "frozen") {
+            await logEvent({
+                type: "ACCOUNT_FROZEN",
+                severity: "critical",
+                userId: user.id,
+                email: user.email,
+                ip: clientIp(req),
+            });
+
+            return res.status(403).json({
+                error: "Учётная запись заморожена",
+            });
+        }
+
+        // Проверка настроек двухфакторной аутентификации
+        if (!user.totp_enabled || !user.totp_secret) {
             return res.status(401).json({
                 error: "Недействительная MFA-сессия",
             });
@@ -440,7 +551,7 @@ authRouter.post(
         if (step === null) {
             await logEvent({
                 type: "TOTP_FAILED",
-                severity: "warning",
+                severity: "medium",
                 userId: user.id,
                 ip: clientIp(req),
             });
@@ -464,7 +575,7 @@ authRouter.post(
         if (fresh !== "OK") {
             await logEvent({
                 type: "TOTP_REPLAY",
-                severity: "warning",
+                severity: "high",
                 userId: user.id,
                 ip: clientIp(req),
             });
@@ -473,6 +584,15 @@ authRouter.post(
                 error: "Код уже использован",
             });
         }
+
+        // Регистрация устройства и проверка сети
+        await completeLogin(
+            user.id,
+            user.email,
+            clientIp(req),
+            fingerprint,
+            req.get("User-Agent") ?? "",
+        );
 
         // Создание полноценной сессии
         const accessToken = signAccess(
