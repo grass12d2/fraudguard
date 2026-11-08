@@ -1,0 +1,14 @@
+# Инфраструктура для практической работы: только база данных, Redis и почтовый сервер.
+# Бэкенд и фронтенд запускаются на компьютере студента командами npm run dev.
+name: fraudguard-dev
+services:
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: fraudguard, POSTGRES_PASSWORD: fraudguard, POSTGRES_DB: fraudguard }
+    ports: ["127.0.0.1:5432:5432"]
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:6379:6379"]
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports: ["127.0.0.1:1025:1025", "127.0.0.1:8025:8025"]
